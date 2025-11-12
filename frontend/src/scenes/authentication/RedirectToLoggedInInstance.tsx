@@ -23,7 +23,7 @@
 import { posthog } from 'posthog-js'
 import { useEffect, useState } from 'react'
 
-import { LemonButton, LemonModal } from '@posthog/lemon-ui'
+import { LemonButton, LemonCheckbox, LemonModal } from '@posthog/lemon-ui'
 
 import { getCookie } from 'lib/api'
 import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
@@ -32,6 +32,8 @@ import { roundToDecimal } from 'lib/utils'
 
 // cookie values
 const PH_CURRENT_INSTANCE = 'ph_current_instance'
+// localStorage key for auto-redirect preference
+const AUTO_REDIRECT_KEY = 'ph_auto_redirect_region'
 
 type Subdomain = 'eu' | 'us'
 
@@ -75,6 +77,7 @@ export function RedirectIfLoggedInOtherInstance(): JSX.Element | null {
     const [redirectUrl, setRedirectUrl] = useState<URL | null>(null)
     const [loggedInSubdomainValue, setLoggedInSubdomainValue] = useState<Subdomain | null>(null)
     const [redirectProgress, setRedirectProgress] = useState(0)
+    const [alwaysRedirect, setAlwaysRedirect] = useState(false)
 
     useOnMountEffect(() => {
         const currentSubdomain = window.location.hostname.split('.')[0]
@@ -97,13 +100,28 @@ export function RedirectIfLoggedInOtherInstance(): JSX.Element | null {
 
         setRedirectUrl(newUrl)
         setLoggedInSubdomainValue(loggedInSubdomain)
-        setIsOpen(true)
 
-        posthog.capture('Redirect to logged-in instance modal shown', {
-            current_subdomain: currentSubdomain,
-            logged_in_subdomain: loggedInSubdomain,
-            redirect_url: newUrl.href,
-        })
+        // Check if user has enabled auto-redirect
+        const autoRedirectEnabled = localStorage.getItem(AUTO_REDIRECT_KEY) === 'true'
+        setAlwaysRedirect(autoRedirectEnabled)
+
+        if (autoRedirectEnabled) {
+            // Redirect immediately if auto-redirect is enabled
+            posthog.capture('Redirect to logged-in instance (auto)', {
+                current_subdomain: currentSubdomain,
+                logged_in_subdomain: loggedInSubdomain,
+                redirect_url: newUrl.href,
+            })
+            window.location.assign(newUrl.href)
+        } else {
+            // Show modal with timer
+            setIsOpen(true)
+            posthog.capture('Redirect to logged-in instance modal shown', {
+                current_subdomain: currentSubdomain,
+                logged_in_subdomain: loggedInSubdomain,
+                redirect_url: newUrl.href,
+            })
+        }
     })
 
     useEffect(() => {
@@ -140,6 +158,14 @@ export function RedirectIfLoggedInOtherInstance(): JSX.Element | null {
 
     const secondsLeft = REDIRECT_TIMEOUT_SECONDS * (1 - redirectProgress / 100)
 
+    const handleAlwaysRedirectChange = (checked: boolean): void => {
+        setAlwaysRedirect(checked)
+        localStorage.setItem(AUTO_REDIRECT_KEY, checked.toString())
+        posthog.capture('Redirect to logged-in instance always redirect toggled', {
+            enabled: checked,
+        })
+    }
+
     return (
         <LemonModal
             isOpen={isOpen}
@@ -170,6 +196,7 @@ export function RedirectIfLoggedInOtherInstance(): JSX.Element | null {
                         : `in ${roundToDecimal(secondsLeft, secondsLeft > 1 ? 0 : 1)} seconds...`}
                 </p>
                 <LemonProgress percent={redirectProgress} smoothing={false} />
+                <LemonCheckbox checked={alwaysRedirect} onChange={handleAlwaysRedirectChange} label="Always redirect" />
             </div>
         </LemonModal>
     )

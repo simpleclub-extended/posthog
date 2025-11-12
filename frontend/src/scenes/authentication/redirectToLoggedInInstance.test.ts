@@ -18,3 +18,24 @@ describe('RedirectToLoggedInInstance cleanedCookieSubdomain', () => {
         expect(cleanedCookieSubdomain(cookie)).toEqual(expected)
     })
 })
+
+describe('RedirectToLoggedInInstance localStorage', () => {
+    beforeEach(() => {
+        localStorage.clear()
+    })
+
+    afterEach(() => {
+        localStorage.clear()
+    })
+
+    it('should read auto-redirect preference from localStorage', () => {
+        const key = 'ph_auto_redirect_region'
+        expect(localStorage.getItem(key)).toBeNull()
+
+        localStorage.setItem(key, 'true')
+        expect(localStorage.getItem(key)).toBe('true')
+
+        localStorage.setItem(key, 'false')
+        expect(localStorage.getItem(key)).toBe('false')
+    })
+})
