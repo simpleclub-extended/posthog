@@ -103,18 +103,19 @@ export function RedirectIfLoggedInOtherInstance(): JSX.Element | null {
 
         // Check if user has enabled auto-redirect
         const autoRedirectEnabled = localStorage.getItem(AUTO_REDIRECT_KEY) === 'true'
-        setAlwaysRedirect(autoRedirectEnabled)
 
         if (autoRedirectEnabled) {
             // Redirect immediately if auto-redirect is enabled
-            posthog.capture('Redirect to logged-in instance (auto)', {
+            posthog.capture('Redirect to logged-in instance modal shown', {
                 current_subdomain: currentSubdomain,
                 logged_in_subdomain: loggedInSubdomain,
                 redirect_url: newUrl.href,
+                auto: true,
             })
             window.location.assign(newUrl.href)
         } else {
             // Show modal with timer
+            setAlwaysRedirect(autoRedirectEnabled)
             setIsOpen(true)
             posthog.capture('Redirect to logged-in instance modal shown', {
                 current_subdomain: currentSubdomain,
