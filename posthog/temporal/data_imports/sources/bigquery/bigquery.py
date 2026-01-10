@@ -8,12 +8,14 @@ from datetime import date, datetime
 import pyarrow as pa
 from dlt.common.normalizers.naming.snake_case import NamingConvention
 from google.api_core.exceptions import Forbidden
+from google.auth import credentials as auth_credentials
 from google.cloud import bigquery, bigquery_storage
 from google.cloud.bigquery.job import QueryJobConfig
 from google.oauth2 import service_account
 from structlog.types import FilteringBoundLogger
 
 from posthog.exceptions_capture import capture_exception
+from posthog.google_cloud_auth import get_google_credentials, get_project_id_from_credentials
 from posthog.temporal.data_imports.pipelines.helpers import incremental_type_to_initial_value
 from posthog.temporal.data_imports.pipelines.pipeline.consts import DEFAULT_TABLE_SIZE_BYTES
 from posthog.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
@@ -23,24 +25,62 @@ from posthog.temporal.data_imports.sources.generated_configs import BigQuerySour
 from products.data_warehouse.backend.types import IncrementalFieldType, PartitionSettings
 
 
+def _build_auth_config_from_key_file(key_file_config: typing.Any) -> dict[str, typing.Any]:
+    """Build auth config dict from BigQueryKeyFileConfig.
+    
+    Supports both service account keys and Workload Identity Federation.
+    The key_file_config is expected to be a dict-like object (either from JSON upload
+    or from the BigQueryKeyFileConfig dataclass).
+    
+    Args:
+        key_file_config: BigQueryKeyFileConfig object or dict
+        
+    Returns:
+        Dict that can be passed to get_google_credentials
+    """
+    # Convert to dict if it's a config object
+    if hasattr(key_file_config, 'to_dict'):
+        config_dict = key_file_config.to_dict()
+    elif hasattr(key_file_config, '__dict__'):
+        config_dict = key_file_config.__dict__
+    else:
+        config_dict = dict(key_file_config)
+    
+    # Check if it's an external_account (Workload Identity Federation)
+    if config_dict.get("type") == "external_account":
+        return config_dict
+    
+    # Otherwise, treat as service account
+    # Filter out None values and build service account config
+    auth_config = {"type": "service_account"}
+    for key in ["project_id", "private_key", "private_key_id", "client_email", "token_uri"]:
+        value = config_dict.get(key)
+        if value is not None:
+            auth_config[key] = value
+    
+    return auth_config
+
+
 def get_schemas(
     config: BigQuerySourceConfig,
     logger: FilteringBoundLogger | None = None,
 ) -> dict[str, list[tuple[str, str]]]:
     schema_list = collections.defaultdict(list)
+    
+    # Build auth config from key_file
+    auth_config = _build_auth_config_from_key_file(config.key_file)
 
-    with bigquery_client(
-        config.key_file.project_id,
-        config.key_file.private_key,
-        config.key_file.private_key_id,
-        config.key_file.client_email,
-        config.key_file.token_uri,
-    ) as bq:
+    with bigquery_client(auth_config=auth_config) as bq:
+        # Determine project ID for the query
+        project_for_query = (
+            config.dataset_project.dataset_project_id
+            if config.dataset_project and config.dataset_project.enabled
+            else auth_config.get("project_id")
+        )
+        
         query = bq.query(
             f"SELECT table_name, column_name, data_type FROM `{config.dataset_id}.INFORMATION_SCHEMA.COLUMNS` ORDER BY table_name ASC",
-            project=config.dataset_project.dataset_project_id
-            if config.dataset_project and config.dataset_project.enabled
-            else config.key_file.project_id,
+            project=project_for_query,
         )
         try:
             rows = query.result()
@@ -60,21 +100,50 @@ def get_schemas(
 
 @contextlib.contextmanager
 def bigquery_client(
-    project_id: str, private_key: str, private_key_id: str, client_email: str, token_uri: str
+    project_id: str | None = None,
+    private_key: str | None = None,
+    private_key_id: str | None = None,
+    client_email: str | None = None,
+    token_uri: str | None = None,
+    auth_config: dict[str, typing.Any] | None = None,
 ) -> typing.Iterator[bigquery.Client]:
-    """Manage a BigQuery client."""
-    credentials = service_account.Credentials.from_service_account_info(
-        {
-            "private_key": private_key,
-            "private_key_id": private_key_id,
-            "token_uri": token_uri,
-            "client_email": client_email,
-            "project_id": project_id,
-        },
-        scopes=["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/cloud-platform"],
-    )
+    """Manage a BigQuery client.
+    
+    Supports both service account keys and Workload Identity Federation.
+    
+    Args:
+        project_id: GCP project ID (for service account auth)
+        private_key: Service account private key (for service account auth)
+        private_key_id: Service account private key ID (for service account auth)
+        client_email: Service account email (for service account auth)
+        token_uri: OAuth token URI (for service account auth)
+        auth_config: Complete auth configuration dict (supports both service account and external_account)
+    """
+    scopes = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/cloud-platform"]
+    
+    if auth_config:
+        # Use new auth_config approach (supports Workload Identity Federation)
+        credentials = get_google_credentials(auth_config, scopes)
+        resolved_project_id = get_project_id_from_credentials(credentials, auth_config)
+    else:
+        # Legacy approach with individual parameters
+        if not all([project_id, private_key, private_key_id, client_email, token_uri]):
+            raise ValueError("Either auth_config or all individual auth parameters must be provided")
+        
+        credentials = service_account.Credentials.from_service_account_info(
+            {
+                "private_key": private_key,
+                "private_key_id": private_key_id,
+                "token_uri": token_uri,
+                "client_email": client_email,
+                "project_id": project_id,
+            },
+            scopes=scopes,
+        )
+        resolved_project_id = project_id
+    
     client = bigquery.Client(
-        project=project_id,
+        project=resolved_project_id,
         credentials=credentials,
     )
 
@@ -85,26 +154,53 @@ def bigquery_client(
 
 
 def delete_table(
-    table_id: str, project_id: str, private_key: str, private_key_id: str, client_email: str, token_uri: str
+    table_id: str,
+    project_id: str | None = None,
+    private_key: str | None = None,
+    private_key_id: str | None = None,
+    client_email: str | None = None,
+    token_uri: str | None = None,
+    auth_config: dict[str, typing.Any] | None = None,
 ) -> None:
-    with bigquery_client(project_id, private_key, private_key_id, client_email, token_uri) as bq:
+    with bigquery_client(
+        project_id=project_id,
+        private_key=private_key,
+        private_key_id=private_key_id,
+        client_email=client_email,
+        token_uri=token_uri,
+        auth_config=auth_config,
+    ) as bq:
         bq.delete_table(table_id, not_found_ok=True)
 
 
 def delete_all_temp_destination_tables(
     dataset_id: str,
     table_prefix: str,
-    project_id: str,
-    dataset_project_id: str | None,
-    private_key: str,
-    private_key_id: str,
-    client_email: str,
-    token_uri: str,
-    logger: None | FilteringBoundLogger,
+    project_id: str | None = None,
+    dataset_project_id: str | None = None,
+    private_key: str | None = None,
+    private_key_id: str | None = None,
+    client_email: str | None = None,
+    token_uri: str | None = None,
+    logger: None | FilteringBoundLogger = None,
+    auth_config: dict[str, typing.Any] | None = None,
 ) -> None:
-    with bigquery_client(project_id, private_key, private_key_id, client_email, token_uri) as bq:
+    with bigquery_client(
+        project_id=project_id,
+        private_key=private_key,
+        private_key_id=private_key_id,
+        client_email=client_email,
+        token_uri=token_uri,
+        auth_config=auth_config,
+    ) as bq:
+        # Determine the project to use
+        if auth_config:
+            resolved_project_id = get_project_id_from_credentials(bq._credentials, auth_config)
+        else:
+            resolved_project_id = project_id
+            
         try:
-            tables = bq.list_tables(bq.dataset(dataset_id, project=dataset_project_id or project_id))
+            tables = bq.list_tables(bq.dataset(dataset_id, project=dataset_project_id or resolved_project_id))
             for table in tables:
                 if table.table_id.startswith(table_prefix):
                     bq.delete_table(table.reference)
@@ -141,42 +237,80 @@ def filter_incremental_fields(columns: list[tuple[str, str]]) -> list[tuple[str,
 
 
 def validate_credentials(dataset_id: str, key_file: dict[str, str], dataset_project_id: str | None) -> bool:
-    project_id = key_file.get("project_id")
-    private_key = key_file.get("private_key")
-    private_key_id = key_file.get("private_key_id")
-    client_email = key_file.get("client_email")
-    token_uri = key_file.get("token_uri")
-
-    if not project_id or not private_key or not private_key_id or not client_email or not token_uri:
-        return False
-
-    with bigquery_client(project_id, private_key, private_key_id, client_email, token_uri) as bq:
-        try:
+    """Validate BigQuery credentials.
+    
+    Supports both service account keys and Workload Identity Federation.
+    
+    Args:
+        dataset_id: BigQuery dataset ID to test access
+        key_file: Either service account key dict or external_account config
+        dataset_project_id: Optional separate project ID for the dataset
+        
+    Returns:
+        True if credentials are valid, False otherwise
+    """
+    try:
+        # Build auth config from key_file
+        auth_config = key_file  # key_file is already a dict with the full config
+        
+        with bigquery_client(auth_config=auth_config) as bq:
+            # Determine project to use
+            if dataset_project_id:
+                project_for_dataset = dataset_project_id
+            else:
+                project_for_dataset = get_project_id_from_credentials(bq._credentials, auth_config)
+            
             bq.list_tables(
-                bq.dataset(dataset_id, project=dataset_project_id or project_id),
+                bq.dataset(dataset_id, project=project_for_dataset),
                 retry=bigquery.DEFAULT_RETRY.with_timeout(5),
             )
             return True
-        except Exception as e:
-            capture_exception(e)
-            return False
+    except Exception as e:
+        capture_exception(e)
+        return False
 
 
 @contextlib.contextmanager
 def bigquery_storage_read_client(
-    project_id: str, private_key: str, private_key_id: str, client_email: str, token_uri: str
+    project_id: str | None = None,
+    private_key: str | None = None,
+    private_key_id: str | None = None,
+    client_email: str | None = None,
+    token_uri: str | None = None,
+    auth_config: dict[str, typing.Any] | None = None,
 ):
-    """Manage a BigQuery Storage client."""
-    credentials = service_account.Credentials.from_service_account_info(
-        {
-            "private_key": private_key,
-            "private_key_id": private_key_id,
-            "token_uri": token_uri,
-            "client_email": client_email,
-            "project_id": project_id,
-        },
-        scopes=["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/cloud-platform"],
-    )
+    """Manage a BigQuery Storage client.
+    
+    Supports both service account keys and Workload Identity Federation.
+    
+    Args:
+        project_id: GCP project ID (for service account auth)
+        private_key: Service account private key (for service account auth)
+        private_key_id: Service account private key ID (for service account auth)
+        client_email: Service account email (for service account auth)
+        token_uri: OAuth token URI (for service account auth)
+        auth_config: Complete auth configuration dict (supports both service account and external_account)
+    """
+    scopes = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/cloud-platform"]
+    
+    if auth_config:
+        # Use new auth_config approach (supports Workload Identity Federation)
+        credentials = get_google_credentials(auth_config, scopes)
+    else:
+        # Legacy approach with individual parameters
+        if not all([project_id, private_key, private_key_id, client_email, token_uri]):
+            raise ValueError("Either auth_config or all individual auth parameters must be provided")
+        
+        credentials = service_account.Credentials.from_service_account_info(
+            {
+                "private_key": private_key,
+                "private_key_id": private_key_id,
+                "token_uri": token_uri,
+                "client_email": client_email,
+                "project_id": project_id,
+            },
+            scopes=scopes,
+        )
 
     client = bigquery_storage.BigQueryReadClient(
         credentials=credentials,
@@ -348,30 +482,67 @@ def _get_query(
 
 
 def bigquery_source(
-    project_id: str,
-    dataset_id: str,
-    table_name: str,
-    private_key: str,
-    private_key_id: str,
-    dataset_project_id: str | None,
-    client_email: str,
-    token_uri: str,
-    should_use_incremental_field: bool,
-    bq_destination_table_id: str,
-    db_incremental_field_last_value: typing.Any,
-    logger: FilteringBoundLogger,
+    project_id: str | None = None,
+    dataset_id: str | None = None,
+    table_name: str | None = None,
+    private_key: str | None = None,
+    private_key_id: str | None = None,
+    dataset_project_id: str | None = None,
+    client_email: str | None = None,
+    token_uri: str | None = None,
+    should_use_incremental_field: bool = False,
+    bq_destination_table_id: str | None = None,
+    db_incremental_field_last_value: typing.Any = None,
+    logger: FilteringBoundLogger | None = None,
     incremental_field: str | None = None,
     incremental_field_type: IncrementalFieldType | None = None,
     partition_size_bytes: int = DEFAULT_PARTITION_TARGET_SIZE_IN_BYTES,
+    auth_config: dict[str, typing.Any] | None = None,
 ) -> SourceResponse:
     """Produce a pipeline source for BigQuery.
 
     This source will iterate through rows in `pyarrow.Table` objects using BigQuery's
     Storage API as much as possible due to higher quotas and lower cost compared to
     alternatives.
+    
+    Supports both service account keys and Workload Identity Federation.
+    
+    Args:
+        project_id: GCP project ID (for service account auth, deprecated - use auth_config)
+        dataset_id: BigQuery dataset ID
+        table_name: BigQuery table name
+        private_key: Service account private key (deprecated - use auth_config)
+        private_key_id: Service account private key ID (deprecated - use auth_config)
+        dataset_project_id: Optional separate project for the dataset
+        client_email: Service account email (deprecated - use auth_config)
+        token_uri: OAuth token URI (deprecated - use auth_config)
+        should_use_incremental_field: Whether to use incremental field
+        bq_destination_table_id: Temporary table ID for incremental syncs
+        db_incremental_field_last_value: Last value of incremental field
+        logger: Logger instance
+        incremental_field: Name of incremental field
+        incremental_field_type: Type of incremental field
+        partition_size_bytes: Target partition size in bytes
+        auth_config: Complete auth configuration (recommended - supports both service account and external_account)
     """
+    if not dataset_id or not table_name or not bq_destination_table_id:
+        raise ValueError("dataset_id, table_name, and bq_destination_table_id are required")
+        
+    if not logger:
+        raise ValueError("logger is required")
 
-    project_id_for_dataset = dataset_project_id or project_id
+    # Determine auth approach
+    if auth_config:
+        # New approach
+        project_id_for_dataset = dataset_project_id or get_project_id_from_credentials(
+            get_google_credentials(auth_config, []), auth_config
+        )
+    else:
+        # Legacy approach
+        if not all([project_id, private_key, private_key_id, client_email, token_uri]):
+            raise ValueError("Either auth_config or all individual auth parameters must be provided")
+        project_id_for_dataset = dataset_project_id or project_id
+
     name = NamingConvention().normalize_identifier(table_name)
     fully_qualified_table_name = f"{project_id_for_dataset}.{dataset_id}.{table_name}"
 
@@ -381,6 +552,7 @@ def bigquery_source(
         private_key_id=private_key_id,
         client_email=client_email,
         token_uri=token_uri,
+        auth_config=auth_config,
     ) as bq_client:
         bq_table = bq_client.get_table(fully_qualified_table_name)
         primary_keys = get_primary_keys(bq_table, bq_client)
@@ -403,6 +575,7 @@ def bigquery_source(
             private_key_id=private_key_id,
             client_email=client_email,
             token_uri=token_uri,
+            auth_config=auth_config,
         ) as bq_client:
             bq_table = bq_client.get_table(fully_qualified_table_name)
 
@@ -469,6 +642,7 @@ def bigquery_source(
                 private_key_id=private_key_id,
                 client_email=client_email,
                 token_uri=token_uri,
+                auth_config=auth_config,
             ) as bq_storage:
                 read_session = bq_storage.create_read_session(
                     parent="projects/{}".format(bq_table.project),
