@@ -44,6 +44,7 @@ from posthog.demo.legacy import demo_route
 from posthog.models import User
 from posthog.models.instance_setting import get_instance_setting
 from posthog.oauth2_urls import urlpatterns as oauth2_urls
+from posthog.workload_identity_urls import urlpatterns as workload_identity_urls
 from posthog.temporal.codec_server import decode_payloads
 
 from products.early_access_features.backend.api import early_access_features
@@ -226,6 +227,7 @@ urlpatterns = [
     path("array/<str:token>/array.js", remote_config.RemoteConfigArrayJSAPIView.as_view()),
     re_path(r"^demo.*", login_required(demo_route)),
     path("", include((oauth2_urls, "oauth2_provider"), namespace="oauth2_provider")),
+    path("workload-identity/", include((workload_identity_urls, "workload_identity"), namespace="workload_identity")),
     # ingestion
     # NOTE: When adding paths here that should be public make sure to update ALWAYS_ALLOWED_ENDPOINTS in middleware.py
     opt_slash_path("decide", decide.get_decide),

@@ -86,6 +86,7 @@ from .user_home_settings import UserHomeSettings
 from .web_experiment import WebExperiment
 
 from .oauth import OAuthAccessToken, OAuthApplication, OAuthGrant, OAuthIDToken, OAuthRefreshToken
+from .workload_identity_key import WorkloadIdentityKey
 
 __all__ = [
     "AlertConfiguration",
@@ -203,6 +204,7 @@ __all__ = [
     "DataWarehouseTable",
     "ScheduledChange",
     "WebExperiment",
+    "WorkloadIdentityKey",
     "Comment",
     # Deprecated models here for backwards compatibility
     "Prompt",
