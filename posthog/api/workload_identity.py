@@ -49,7 +49,7 @@ def get_workload_identity_issuer() -> str:
     site_url = settings.SITE_URL
     
     # For now, use the main site URL with a path prefix
-    # In production, this should be a separate subdomain like integrations.posthog.com
+    # In production, this could be a separate subdomain like integrations.posthog.com
     return f"{site_url}/workload-identity"
 
 
