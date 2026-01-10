@@ -950,25 +950,6 @@ class GoogleCloudIntegration:
     def integration_from_key(
         cls, kind: str, key_info: dict, team_id: int, created_by: User | None = None
     ) -> Integration:
-        """Create or update a Google Cloud integration from credentials.
-        
-        Supports both service account keys and Workload Identity Federation.
-        
-        Args:
-            kind: Type of Google Cloud integration (google-pubsub, google-cloud-storage)
-            key_info: Either service account key dict or external_account config
-            team_id: Team ID
-            created_by: User creating the integration
-            
-        Returns:
-            Integration instance
-            
-        Raises:
-            ValidationError: If authentication fails
-        """
-        from posthog.google_cloud_auth import get_google_credentials, get_project_id_from_credentials
-        from google.auth.transport.requests import Request as GoogleRequest
-        
         if kind == "google-pubsub":
             scope = "https://www.googleapis.com/auth/pubsub"
         elif kind == "google-cloud-storage":
@@ -977,38 +958,20 @@ class GoogleCloudIntegration:
             raise NotImplementedError(f"Google Cloud integration kind {kind} not implemented")
 
         try:
-            # Use centralized auth module to support both service account and Workload Identity
-            credentials = get_google_credentials(key_info, scopes=[scope])
+            credentials = service_account.Credentials.from_service_account_info(key_info, scopes=[scope])
             credentials.refresh(GoogleRequest())
-            
-            # Determine integration ID
-            if hasattr(credentials, 'service_account_email') and credentials.service_account_email:
-                integration_id = credentials.service_account_email
-            elif key_info.get("type") == "external_account":
-                # For external accounts, try to extract from impersonation URL or use a generic identifier
-                impersonation_url = key_info.get("service_account_impersonation_url", "")
-                if "serviceAccounts/" in impersonation_url:
-                    integration_id = impersonation_url.split("serviceAccounts/")[1].split(":")[0]
-                else:
-                    # Fall back to using audience or a hash of the config
-                    integration_id = key_info.get("audience", f"external-{hash(str(key_info))}")
-            else:
-                integration_id = key_info.get("client_email", "unknown")
-                
-        except Exception as e:
-            logger.exception("Failed to authenticate with provided credentials", error=str(e))
-            raise ValidationError(f"Failed to authenticate with provided credentials: {str(e)}")
+        except Exception:
+            raise ValidationError(f"Failed to authenticate with provided service account key")
 
         integration, created = Integration.objects.update_or_create(
             team_id=team_id,
             kind=kind,
-            integration_id=integration_id,
+            integration_id=credentials.service_account_email,
             defaults={
                 "config": {
-                    "expires_in": int(credentials.expiry.timestamp() - time.time()) if credentials.expiry else 3600,
+                    "expires_in": credentials.expiry.timestamp() - int(time.time()),
                     "refreshed_at": int(time.time()),
                     "access_token": credentials.token,
-                    "auth_type": key_info.get("type", "service_account"),  # Track auth type
                 },
                 "sensitive_config": key_info,
                 "created_by": created_by,
@@ -1033,13 +996,9 @@ class GoogleCloudIntegration:
         return time.time() > refreshed_at + expires_in - time_threshold.total_seconds()
 
     def refresh_access_token(self):
-        """Refresh the access token for the integration.
-        
-        Supports both service account keys and Workload Identity Federation.
         """
-        from posthog.google_cloud_auth import get_google_credentials
-        from google.auth.transport.requests import Request as GoogleRequest
-        
+        Refresh the access token for the integration if necessary
+        """
         if self.integration.kind == "google-pubsub":
             scope = "https://www.googleapis.com/auth/pubsub"
         elif self.integration.kind == "google-cloud-storage":
@@ -1047,19 +1006,19 @@ class GoogleCloudIntegration:
         else:
             raise NotImplementedError(f"Google Cloud integration kind {self.integration.kind} not implemented")
 
+        credentials = service_account.Credentials.from_service_account_info(
+            self.integration.sensitive_config, scopes=[scope]
+        )
+
         try:
-            # Use centralized auth module to support both service account and Workload Identity
-            credentials = get_google_credentials(self.integration.sensitive_config, scopes=[scope])
             credentials.refresh(GoogleRequest())
-        except Exception as e:
-            logger.exception("Failed to refresh credentials", error=str(e))
-            raise ValidationError(f"Failed to refresh credentials: {str(e)}")
+        except Exception:
+            raise ValidationError(f"Failed to authenticate with provided service account key")
 
         self.integration.config = {
-            "expires_in": int(credentials.expiry.timestamp() - time.time()) if credentials.expiry else 3600,
+            "expires_in": credentials.expiry.timestamp() - int(time.time()),
             "refreshed_at": int(time.time()),
             "access_token": credentials.token,
-            "auth_type": self.integration.sensitive_config.get("type", "service_account"),
         }
         self.integration.save()
         reload_integrations_on_workers(self.integration.team_id, [self.integration.id])

@@ -1,7 +1,6 @@
 from datetime import datetime
 from typing import cast
 
-from posthog.google_cloud_auth import get_google_credentials, get_project_id_from_credentials
 from posthog.schema import (
     ExternalDataSourceType as SchemaExternalDataSourceType,
     SourceConfig,
@@ -14,7 +13,6 @@ from posthog.schema import (
 
 from posthog.temporal.data_imports.pipelines.pipeline.typings import SourceInputs, SourceResponse
 from posthog.temporal.data_imports.sources.bigquery.bigquery import (
-    _build_auth_config_from_key_file,
     bigquery_source,
     delete_all_temp_destination_tables,
     delete_table,
@@ -65,12 +63,15 @@ class BigQuerySource(BaseSource[BigQuerySourceConfig]):
         ]
 
     def validate_credentials(self, config: BigQuerySourceConfig, team_id: int) -> tuple[bool, str | None]:
-        # Build auth config from key_file - it should already be the full config dict
-        key_file_dict = config.key_file.to_dict() if hasattr(config.key_file, 'to_dict') else dict(config.key_file.__dict__ if hasattr(config.key_file, '__dict__') else config.key_file)
-        
         if validate_bigquery_credentials(
             config.dataset_id,
-            key_file_dict,
+            {
+                "project_id": config.key_file.project_id,
+                "private_key": config.key_file.private_key,
+                "private_key_id": config.key_file.private_key_id,
+                "client_email": config.key_file.client_email,
+                "token_uri": config.key_file.token_uri,
+            },
             config.dataset_project.dataset_project_id if config.dataset_project else None,
         ):
             return True, None
@@ -78,12 +79,8 @@ class BigQuerySource(BaseSource[BigQuerySourceConfig]):
         return False, "Invalid BigQuery credentials"
 
     def source_for_pipeline(self, config: BigQuerySourceConfig, inputs: SourceInputs) -> SourceResponse:
-        # Build auth config from key_file
-        auth_config = _build_auth_config_from_key_file(config.key_file)
-        
-        # Get project ID from auth config
-        credentials = get_google_credentials(auth_config, [])
-        project_id = get_project_id_from_credentials(credentials, auth_config)
+        if not config.key_file.private_key:
+            raise ValueError(f"Missing private key for BigQuery: '{inputs.job_id}'")
 
         dataset_project_id: str | None = None
         destination_table_dataset_id = config.dataset_id
@@ -111,20 +108,29 @@ class BigQuerySource(BaseSource[BigQuerySourceConfig]):
         # relaxed with using a relatively long UUID as part of the prefix.
         destination_table_prefix = build_destination_table_prefix(inputs.schema_id)
 
-        destination_table = f"{project_id}.{destination_table_dataset_id}.{destination_table_prefix}_{inputs.job_id.replace('-', '_')}_{str(datetime.now().timestamp()).replace('.', '')}"
+        destination_table = f"{config.key_file.project_id}.{destination_table_dataset_id}.{destination_table_prefix}_{inputs.job_id.replace('-', '_')}_{str(datetime.now().timestamp()).replace('.', '')}"
 
         delete_all_temp_destination_tables(
             dataset_id=destination_table_dataset_id,
             table_prefix=destination_table_prefix,
+            project_id=config.key_file.project_id,
             dataset_project_id=dataset_project_id,
+            private_key=config.key_file.private_key,
+            private_key_id=config.key_file.private_key_id,
+            client_email=config.key_file.client_email,
+            token_uri=config.key_file.token_uri,
             logger=inputs.logger,
-            auth_config=auth_config,
         )
 
         try:
             return bigquery_source(
                 dataset_id=config.dataset_id,
+                project_id=config.key_file.project_id,
                 dataset_project_id=dataset_project_id,
+                private_key=config.key_file.private_key,
+                private_key_id=config.key_file.private_key_id,
+                client_email=config.key_file.client_email,
+                token_uri=config.key_file.token_uri,
                 table_name=inputs.schema_name,
                 should_use_incremental_field=inputs.should_use_incremental_field,
                 logger=inputs.logger,
@@ -134,13 +140,16 @@ class BigQuerySource(BaseSource[BigQuerySourceConfig]):
                 db_incremental_field_last_value=inputs.db_incremental_field_last_value
                 if inputs.should_use_incremental_field
                 else None,
-                auth_config=auth_config,
             )
         finally:
             # Delete the destination table (if it exists) after we're done with it
             delete_table(
                 table_id=destination_table,
-                auth_config=auth_config,
+                project_id=config.key_file.project_id,
+                private_key=config.key_file.private_key,
+                private_key_id=config.key_file.private_key_id,
+                client_email=config.key_file.client_email,
+                token_uri=config.key_file.token_uri,
             )
             inputs.logger.info(f"Deleting bigquery temp destination table: {destination_table}")
 
@@ -156,10 +165,9 @@ class BigQuerySource(BaseSource[BigQuerySourceConfig]):
                     SourceFieldFileUploadConfig(
                         name="key_file",
                         label="Google Cloud JSON key file",
-                        caption="Upload either a service account key JSON file or a Workload Identity Federation configuration file",
                         fileFormat=SourceFieldFileUploadJsonFormatConfig(
                             format=".json",
-                            keys=[],  # Accept any JSON structure to support both service account and external_account
+                            keys=["project_id", "private_key", "private_key_id", "client_email", "token_uri"],
                         ),
                         required=True,
                     ),
