@@ -40,8 +40,6 @@ def get_workload_identity_issuer() -> str:
     
     Uses a dedicated subdomain to separate from regular OAuth flows.
     """
-    # Use the site URL but replace the subdomain with 'integrations'
-    # e.g., https://us.posthog.com -> https://us.integrations.posthog.com
     site_url = settings.SITE_URL
     
     # For now, use the main site URL with a path prefix
