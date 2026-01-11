@@ -87,6 +87,7 @@ from .web_experiment import WebExperiment
 
 from .oauth import OAuthAccessToken, OAuthApplication, OAuthGrant, OAuthIDToken, OAuthRefreshToken
 from .workload_identity_key import WorkloadIdentityKey
+from .workload_identity_config import WorkloadIdentityConfig
 
 __all__ = [
     "AlertConfiguration",
@@ -205,6 +206,7 @@ __all__ = [
     "ScheduledChange",
     "WebExperiment",
     "WorkloadIdentityKey",
+    "WorkloadIdentityConfig",
     "Comment",
     # Deprecated models here for backwards compatibility
     "Prompt",
